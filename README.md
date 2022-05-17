@@ -20,4 +20,11 @@ We aim to reproduce the results independently, without use of the original code.
 │         ├── val
 │         └── test
 ```
-2. 
+2.
+
+
+
+
+### Note 
+DataLoading code taken from [lwpyr/CSP-pedestrian-in-pytorch](https://github.com/lwpyr/CSP-pedestrian-detection-in-pytorch/).
+We plan to change that as well.
