@@ -1,953 +1,73 @@
-import os.path as osp
-
-import mmcv
-import numpy as np
-from mmcv.parallel import DataContainer as DC
-from torch.utils.data import Dataset
-
-import mmcv
-import numpy as np
-import torch
-
-__all__ = [
-    'ImageTransform', 'BboxTransform', 'MaskTransform', 'SegMapTransform',
-    'Numpy2Tensor'
-]
-
-
-class ImageTransform(object):
-    """Preprocess an image.
-
-    1. rescale the image to expected size
-    2. normalize the image
-    3. flip the image (if needed)
-    4. pad the image (if needed)
-    5. transpose to (c, h, w)
-    """
-
-    def __init__(self,
-                 mean=(0, 0, 0),
-                 std=(1, 1, 1),
-                 to_rgb=True,
-                 size_divisor=None):
-        self.mean = np.array(mean, dtype=np.float32)
-        self.std = np.array(std, dtype=np.float32)
-        self.to_rgb = to_rgb
-        self.size_divisor = size_divisor
-
-    def __call__(self, img, scale, flip=False, keep_ratio=True):
-        if keep_ratio:
-            img, scale_factor = mmcv.imrescale(img, scale, return_scale=True)
-        else:
-            img, w_scale, h_scale = mmcv.imresize(
-                img, scale, return_scale=True)
-            scale_factor = np.array(
-                [w_scale, h_scale, w_scale, h_scale], dtype=np.float32)
-        img_shape = img.shape
-        img = mmcv.imnormalize(img, self.mean, self.std, self.to_rgb)
-        if flip:
-            img = mmcv.imflip(img)
-        if self.size_divisor is not None:
-            img = mmcv.impad_to_multiple(img, self.size_divisor)
-            pad_shape = img.shape
-        else:
-            pad_shape = img_shape
-        img = img.transpose(2, 0, 1)
-        return img, img_shape, pad_shape, scale_factor
-
-
-def bbox_flip(bboxes, img_shape):
-    """Flip bboxes horizontally.
-
-    Args:
-        bboxes(ndarray): shape (..., 4*k)
-        img_shape(tuple): (height, width)
-    """
-    assert bboxes.shape[-1] % 4 == 0
-    w = img_shape[1]
-    flipped = bboxes.copy()
-    flipped[..., 0::4] = w - bboxes[..., 2::4] - 1
-    flipped[..., 2::4] = w - bboxes[..., 0::4] - 1
-    return flipped
-
-
-class BboxTransform(object):
-    """Preprocess gt bboxes.
-
-    1. rescale bboxes according to image size
-    2. flip bboxes (if needed)
-    3. pad the first dimension to `max_num_gts`
-    """
-
-    def __init__(self, max_num_gts=None):
-        self.max_num_gts = max_num_gts
-
-    def __call__(self, bboxes, img_shape, scale_factor, flip=False):
-        gt_bboxes = bboxes * scale_factor
-        if flip:
-            gt_bboxes = bbox_flip(gt_bboxes, img_shape)
-        gt_bboxes[:, 0::2] = np.clip(gt_bboxes[:, 0::2], 0, img_shape[1] - 1)
-        gt_bboxes[:, 1::2] = np.clip(gt_bboxes[:, 1::2], 0, img_shape[0] - 1)
-        if self.max_num_gts is None:
-            return gt_bboxes
-        else:
-            num_gts = gt_bboxes.shape[0]
-            padded_bboxes = np.zeros((self.max_num_gts, 4), dtype=np.float32)
-            padded_bboxes[:num_gts, :] = gt_bboxes
-            return padded_bboxes
-
-
-class MaskTransform(object):
-    """Preprocess masks.
-
-    1. resize masks to expected size and stack to a single array
-    2. flip the masks (if needed)
-    3. pad the masks (if needed)
-    """
-
-    def __call__(self, masks, pad_shape, scale_factor, flip=False):
-        masks = [
-            mmcv.imrescale(mask, scale_factor, interpolation='nearest')
-            for mask in masks
-        ]
-        if flip:
-            masks = [mask[:, ::-1] for mask in masks]
-        padded_masks = [
-            mmcv.impad(mask, pad_shape[:2], pad_val=0) for mask in masks
-        ]
-        padded_masks = np.stack(padded_masks, axis=0)
-        return padded_masks
-
-
-class SegMapTransform(object):
-    """Preprocess semantic segmentation maps.
-
-    1. rescale the segmentation map to expected size
-    3. flip the image (if needed)
-    4. pad the image (if needed)
-    """
-
-    def __init__(self, size_divisor=None):
-        self.size_divisor = size_divisor
-
-    def __call__(self, img, scale, flip=False, keep_ratio=True):
-        if keep_ratio:
-            img = mmcv.imrescale(img, scale, interpolation='nearest')
-        else:
-            img = mmcv.imresize(img, scale, interpolation='nearest')
-        if flip:
-            img = mmcv.imflip(img)
-        if self.size_divisor is not None:
-            img = mmcv.impad_to_multiple(img, self.size_divisor)
-        return img
-
-
-class Numpy2Tensor(object):
-
-    def __init__(self):
-        pass
-
-    def __call__(self, *args):
-        if len(args) == 1:
-            return torch.from_numpy(args[0])
-        else:
-            return tuple([torch.from_numpy(np.array(array)) for array in args])
-
-def to_tensor(data):
-    """Convert objects of various python types to :obj:`torch.Tensor`.
-
-    Supported types are: :class:`numpy.ndarray`, :class:`torch.Tensor`,
-    :class:`Sequence`, :class:`int` and :class:`float`.
-    """
-    if isinstance(data, torch.Tensor):
-        return data
-    elif isinstance(data, np.ndarray):
-        return torch.from_numpy(data)
-    elif isinstance(data, Sequence) and not mmcv.is_str(data):
-        return torch.tensor(data)
-    elif isinstance(data, int):
-        return torch.LongTensor([data])
-    elif isinstance(data, float):
-        return torch.FloatTensor([data])
-    else:
-        raise TypeError('type {} cannot be converted to tensor.'.format(
-            type(data)))
-
-
-def random_scale(img_scales, mode='range'):
-    """Randomly select a scale from a list of scales or scale ranges.
-
-    Args:
-        img_scales (list[tuple]): Image scale or scale range.
-        mode (str): "range" or "value".
-
-    Returns:
-        tuple: Sampled image scale.
-    """
-    num_scales = len(img_scales)
-    if num_scales == 1:  # fixed scale is specified
-        img_scale = img_scales[0]
-    elif num_scales == 2:  # randomly sample a scale
-        if mode == 'range':
-            img_scale_long = [max(s) for s in img_scales]
-            img_scale_short = [min(s) for s in img_scales]
-            long_edge = np.random.randint(
-                min(img_scale_long),
-                max(img_scale_long) + 1)
-            short_edge = np.random.randint(
-                min(img_scale_short),
-                max(img_scale_short) + 1)
-            img_scale = (long_edge, short_edge)
-        elif mode == 'value':
-            img_scale = img_scales[np.random.randint(num_scales)]
-    else:
-        if mode != 'value':
-            raise ValueError(
-                'Only "value" mode supports more than 2 image scales')
-        img_scale = img_scales[np.random.randint(num_scales)]
-    return img_scale
-
-class ExtraAugmentation(object):
-
-    def __init__(self,
-                 photo_metric_distortion=None,
-                 expand=None,
-                 random_crop=None):
-        self.transforms = []
-        if photo_metric_distortion is not None:
-            self.transforms.append(
-                PhotoMetricDistortion(**photo_metric_distortion))
-        if expand is not None:
-            self.transforms.append(Expand(**expand))
-        if random_crop is not None:
-            self.transforms.append(RandomCrop(**random_crop))
-
-    def __call__(self, img, boxes, labels):
-        img = img.astype(np.float32)
-        for transform in self.transforms:
-            img, boxes, labels = transform(img, boxes, labels)
-        return img, boxes, labels
-
-class CustomDataset(Dataset):
-    """Custom dataset for detection.
-    Annotation format:
-    [
-        {
-            'filename': 'a.jpg',
-            'width': 1280,
-            'height': 720,
-            'ann': {
-                'bboxes': <np.ndarray> (n, 4),
-                'labels': <np.ndarray> (n, ),
-                'bboxes_ignore': <np.ndarray> (k, 4),
-                'labels_ignore': <np.ndarray> (k, 4) (optional field)
-            }
-        },
-        ...
-    ]
-    The `ann` field is optional for testing.
-    """
-
-    CLASSES = None
-
-    def __init__(self,
-                 ann_file,
-                 img_prefix,
-                 img_scale,
-                 img_norm_cfg,
-                 multiscale_mode='value',
-                 size_divisor=None,
-                 proposal_file=None,
-                 num_max_proposals=1000,
-                 flip_ratio=0,
-                 with_mask=True,
-                 with_crowd=True,
-                 with_label=True,
-                 with_semantic_seg=False,
-                 seg_prefix=None,
-                 seg_scale_factor=1,
-                 extra_aug=None,
-                 resize_keep_ratio=True,
-                 test_mode=False,
-                 remove_small_box=False,
-                 small_box_size=8,
-                 strides=None,
-                 regress_ranges=None,
-                 upper_factor=None,
-                 upper_more_factor=None):
-        # prefix of images path
-        self.img_prefix = img_prefix
-
-        # load annotations (and proposals)
-        self.img_infos = self.load_annotations(ann_file)
-        if proposal_file is not None:
-            self.proposals = self.load_proposals(proposal_file)
-        else:
-            self.proposals = None
-        # filter images with no annotation during training
-        if not test_mode:
-            valid_inds = self._filter_imgs()
-            self.img_infos = [self.img_infos[i] for i in valid_inds]
-            if self.proposals is not None:
-                self.proposals = [self.proposals[i] for i in valid_inds]
-
-        # (long_edge, short_edge) or [(long1, short1), (long2, short2), ...]
-        self.img_scales = img_scale if isinstance(img_scale,
-                                                  list) else [img_scale]
-        assert mmcv.is_list_of(self.img_scales, tuple)
-        # normalization configs
-        self.img_norm_cfg = img_norm_cfg
-
-        # multi-scale mode (only applicable for multi-scale training)
-        self.multiscale_mode = multiscale_mode
-        assert multiscale_mode in ['value', 'range']
-
-        # max proposals per image
-        self.num_max_proposals = num_max_proposals
-        # flip ratio
-        self.flip_ratio = flip_ratio
-        assert flip_ratio >= 0 and flip_ratio <= 1
-        # padding border to ensure the image size can be divided by
-        # size_divisor (used for FPN)
-        self.size_divisor = size_divisor
-
-        # with mask or not (reserved field, takes no effect)
-        self.with_mask = with_mask
-        # some datasets provide bbox annotations as ignore/crowd/difficult,
-        # if `with_crowd` is True, then these info is returned.
-        self.with_crowd = with_crowd
-        # with label is False for RPN
-        self.with_label = with_label
-        # with semantic segmentation (stuff) annotation or not
-        self.with_seg = with_semantic_seg
-        # prefix of semantic segmentation map path
-        self.seg_prefix = seg_prefix
-        # rescale factor for segmentation maps
-        self.seg_scale_factor = seg_scale_factor
-        # in test mode or not
-        self.test_mode = test_mode
-        # remove small size box in gt
-        self.remove_small_box = remove_small_box
-        # the smallest box edge
-        self.small_box_size = small_box_size
-        # strides of FPN style outputs, used for generating groundtruth feature maps
-        self.strides = strides
-        # regress range of FPN style outputs, used for generating groundtruth feature maps
-        self.regress_ranges = regress_ranges
-        # upper factor for Irtiza's model which use three branches to predict upper box, full box, lower box
-        self.upper_factor = upper_factor
-        # split the upper box into more boxes
-        self.upper_more_factor = upper_more_factor
-
-        # set group flag for the sampler
-        if not self.test_mode:
-            self._set_group_flag()
-        # transforms
-        self.img_transform = ImageTransform(
-            size_divisor=self.size_divisor, **self.img_norm_cfg)
-        self.bbox_transform = BboxTransform()
-        self.mask_transform = MaskTransform()
-        self.seg_transform = SegMapTransform(self.size_divisor)
-        self.numpy2tensor = Numpy2Tensor()
-
-        # if use extra augmentation
-        if extra_aug is not None:
-            self.extra_aug = ExtraAugmentation(**extra_aug)
-        else:
-            self.extra_aug = None
-
-        # image rescale if keep ratio
-        self.resize_keep_ratio = resize_keep_ratio
-
-    def __len__(self):
-        return len(self.img_infos)
-
-    def load_annotations(self, ann_file):
-        return mmcv.load(ann_file)
-
-    def load_proposals(self, proposal_file):
-        return mmcv.load(proposal_file)
-
-    def get_ann_info(self, idx):
-        return self.img_infos[idx]['ann']
-
-    def _filter_imgs(self, min_size=32):
-        """Filter images too small."""
-        valid_inds = []
-        for i, img_info in enumerate(self.img_infos):
-            if min(img_info['width'], img_info['height']) >= min_size:
-                valid_inds.append(i)
-        return valid_inds
-
-    def _set_group_flag(self):
-        """Set flag according to image aspect ratio.
-        Images with aspect ratio greater than 1 will be set as group 1,
-        otherwise group 0.
-        """
-        self.flag = np.zeros(len(self), dtype=np.uint8)
-        for i in range(len(self)):
-            img_info = self.img_infos[i]
-            if img_info['width'] / img_info['height'] > 1:
-                self.flag[i] = 1
-
-    def _rand_another(self, idx):
-        pool = np.where(self.flag == self.flag[idx])[0]
-        return np.random.choice(pool)
-
-    def __getitem__(self, idx):
-        if self.test_mode:
-            return self.prepare_test_img(idx)
-        while True:
-            data = self.prepare_train_img(idx)
-            if data is None:
-                idx = self._rand_another(idx)
-                continue
-            return data
-
-    def prepare_train_img(self, idx):
-        img_info = self.img_infos[idx]
-        # load image
-        img = mmcv.imread(osp.join(self.img_prefix, img_info['filename']))
-        # load proposals if necessary
-        if self.proposals is not None:
-            proposals = self.proposals[idx][:self.num_max_proposals]
-            # TODO: Handle empty proposals properly. Currently images with
-            # no proposals are just ignored, but they can be used for
-            # training in concept.
-            if len(proposals) == 0:
-                return None
-            if not (proposals.shape[1] == 4 or proposals.shape[1] == 5):
-                raise AssertionError(
-                    'proposals should have shapes (n, 4) or (n, 5), '
-                    'but found {}'.format(proposals.shape))
-            if proposals.shape[1] == 5:
-                scores = proposals[:, 4, None]
-                proposals = proposals[:, :4]
-            else:
-                scores = None
-
-        ann = self.get_ann_info(idx)
-        gt_bboxes = ann['bboxes']
-        gt_labels = ann['labels']
-        if self.with_crowd:
-            gt_bboxes_ignore = ann['bboxes_ignore']
-
-        # skip the image if there is no valid gt bbox
-        if len(gt_bboxes) == 0:
-            return None
-
-        # extra augmentation
-        if self.extra_aug is not None:
-            img, gt_bboxes, gt_labels = self.extra_aug(img, gt_bboxes,
-                                                       gt_labels)
-            # Todo, make similar transform for masks
-            if self.with_mask:
-                gt_masks = []
-                for bbox in gt_bboxes:
-                    mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
-                    x1, y1, x2, y2 = bbox
-                    mask[int(y1):int(y2), int(x1):int(x2)] = 1
-                    gt_masks.append(mask)
-                ann['masks'] = gt_masks
-
-        # apply transforms
-        flip = True if np.random.rand() < self.flip_ratio else False
-        # randomly sample a scale
-        img_scale = random_scale(self.img_scales, self.multiscale_mode)
-        img, img_shape, pad_shape, scale_factor = self.img_transform(
-            img, img_scale, flip, keep_ratio=self.resize_keep_ratio)
-        img = img.copy()
-        if self.with_seg:
-            gt_seg = mmcv.imread(
-                osp.join(self.seg_prefix, img_info['file_name'].replace(
-                    'jpg', 'png')),
-                flag='unchanged')
-            gt_seg = self.seg_transform(gt_seg.squeeze(), img_scale, flip)
-            gt_seg = mmcv.imrescale(
-                gt_seg, self.seg_scale_factor, interpolation='nearest')
-            gt_seg = gt_seg[None, ...]
-        if self.proposals is not None:
-            proposals = self.bbox_transform(proposals, img_shape, scale_factor,
-                                            flip)
-            proposals = np.hstack(
-                [proposals, scores]) if scores is not None else proposals
-        gt_bboxes = self.bbox_transform(gt_bboxes, img_shape, scale_factor,
-                                        flip)
-        if self.remove_small_box:
-            gt_bboxes_edges = gt_bboxes[:, [2, 3]] - gt_bboxes[:, [0, 1]]
-            small_bboxes_edge = gt_bboxes_edges.min(-1)
-            small_bboxes_edge = small_bboxes_edge > self.small_box_size
-            inds = small_bboxes_edge.nonzero()
-            if len(inds[0]) == 0:
-                return None
-            else:
-                gt_bboxes = gt_bboxes[inds]
-                gt_labels = gt_labels[inds]
-        if self.with_crowd:
-            gt_bboxes_ignore = self.bbox_transform(gt_bboxes_ignore, img_shape,
-                                                   scale_factor, flip)
-        if self.with_mask:
-            gt_masks = self.mask_transform(ann['masks'], pad_shape,
-                                           scale_factor, flip)
-
-        ori_shape = (img_info['height'], img_info['width'], 3)
-        img_meta = dict(
-            ori_shape=ori_shape,
-            img_shape=img_shape,
-            pad_shape=pad_shape,
-            scale_factor=scale_factor,
-            flip=flip)
-
-        data = dict(
-            img=DC(to_tensor(img), stack=True),
-            img_meta=DC(img_meta, cpu_only=True),
-            gt_bboxes=DC(to_tensor(gt_bboxes)))
-        if self.proposals is not None:
-            data['proposals'] = DC(to_tensor(proposals))
-        if self.with_label:
-            data['gt_labels'] = DC(to_tensor(gt_labels))
-        if self.with_crowd:
-            data['gt_bboxes_ignore'] = DC(to_tensor(gt_bboxes_ignore))
-        if self.with_mask:
-            data['gt_masks'] = DC(gt_masks, cpu_only=True)
-        if self.with_seg:
-            data['gt_semantic_seg'] = DC(to_tensor(gt_seg), stack=True)
-        return data
-
-    def prepare_test_img(self, idx):
-        """Prepare an image for testing (multi-scale and flipping)"""
-        img_info = self.img_infos[idx]
-        ann = self.get_ann_info(idx)
-        gt_bboxes = ann['bboxes']
-
-        img = mmcv.imread(osp.join(self.img_prefix, img_info['filename']))
-        if self.proposals is not None:
-            proposal = self.proposals[idx][:self.num_max_proposals]
-            if not (proposal.shape[1] == 4 or proposal.shape[1] == 5):
-                raise AssertionError(
-                    'proposals should have shapes (n, 4) or (n, 5), '
-                    'but found {}'.format(proposal.shape))
-        else:
-            proposal = None
-
-        def prepare_single(img, scale, flip, proposal=None):
-            _img, img_shape, pad_shape, scale_factor = self.img_transform(
-                img, scale, flip, keep_ratio=self.resize_keep_ratio)
-            _img = to_tensor(_img)
-            _img_meta = dict(
-                ori_shape=(img_info['height'], img_info['width'], 3),
-                img_shape=img_shape,
-                pad_shape=pad_shape,
-                id=img_info["id"],
-                scale_factor=scale_factor,
-                flip=flip)
-
-            if proposal is not None:
-                if proposal.shape[1] == 5:
-                    score = proposal[:, 4, None]
-                    proposal = proposal[:, :4]
-                else:
-                    score = None
-                _proposal = self.bbox_transform(proposal, img_shape,
-                                                scale_factor, flip)
-                _proposal = np.hstack(
-                    [_proposal, score]) if score is not None else _proposal
-                _proposal = to_tensor(_proposal)
-            else:
-                _proposal = None
-            return _img, _img_meta, _proposal, scale_factor
-
-        imgs = []
-        img_metas = []
-        proposals = []
-        for scale in self.img_scales:
-            _img, _img_meta, _proposal, scale_factor = prepare_single(
-                img, scale, False, proposal)
-            _img_meta["gts"] = gt_bboxes * scale_factor
-            imgs.append(_img)
-            img_metas.append(DC(_img_meta, cpu_only=True))
-            proposals.append(_proposal)
-            if self.flip_ratio > 0:
-                _img, _img_meta, _proposal, scale_factor = prepare_single(
-                    img, scale, True, proposal)
-                imgs.append(_img)
-                img_metas.append(DC(_img_meta, cpu_only=True))
-                proposals.append(_proposal)
-        data = dict(img=imgs, img_meta=img_metas)
-        if self.proposals is not None:
-            data['proposals'] = proposals
-        return data
-
-import numpy as np
-from pycocotools.coco import COCO
-
+from __future__ import division
+import os
+from scipy import io as scio
+import copy
+from PIL.Image import Resampling
+import sys
+import random
 import cv2
+import torch
+import numpy as np
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.transforms import Compose, ColorJitter, ToTensor, Normalize
 
-import os.path as osp
-import mmcv
-from mmcv.parallel import DataContainer as DC
 
-INF = 1e8
+def get_citypersons(root_dir='data/cityperson', mode='train'):
+    all_img_path = os.path.join(root_dir, 'images')
+    all_anno_path = os.path.join(root_dir, 'annotations')
+    rows, cols = 1024, 2048
 
-class CocoCSPORIDataset(CustomDataset):
+    anno_path = os.path.join(all_anno_path, 'anno_' + mode + '.mat')
+    image_data = []
+    annos = scio.loadmat(anno_path)
+    index = 'anno_' + mode + '_aligned'
+    valid_count = 0
+    iggt_count = 0
+    box_count = 0
 
-    CLASSES = ('person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
-               'train', 'truck', 'boat', 'traffic_light', 'fire_hydrant',
-               'stop_sign', 'parking_meter', 'bench', 'bird', 'cat', 'dog',
-               'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe',
-               'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
-               'skis', 'snowboard', 'sports_ball', 'kite', 'baseball_bat',
-               'baseball_glove', 'skateboard', 'surfboard', 'tennis_racket',
-               'bottle', 'wine_glass', 'cup', 'fork', 'knife', 'spoon', 'bowl',
-               'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot',
-               'hot_dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
-               'potted_plant', 'bed', 'dining_table', 'toilet', 'tv', 'laptop',
-               'mouse', 'remote', 'keyboard', 'cell_phone', 'microwave',
-               'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock',
-               'vase', 'scissors', 'teddy_bear', 'hair_drier', 'toothbrush')
-    def __init__(self,
-                 ann_file,
-                 img_prefix,
-                 img_scale,
-                 img_norm_cfg,
-                 multiscale_mode='value',
-                 size_divisor=None,
-                 proposal_file=None,
-                 num_max_proposals=1000,
-                 small_box_to_ignore=False,
-                 flip_ratio=0,
-                 with_mask=True,
-                 with_crowd=True,
-                 with_label=True,
-                 with_semantic_seg=False,
-                 seg_prefix=None,
-                 seg_scale_factor=1,
-                 extra_aug=None,
-                 resize_keep_ratio=True,
-                 test_mode=False,
-                 remove_small_box=False,
-                 small_box_size=8,
-                 strides=None,
-                 regress_ranges=None,
-                 upper_factor=None,
-                 upper_more_factor=None,
-                 with_width=False):
-        # prefix of images path
-        self.small_box_to_ignore = small_box_to_ignore
-        self.img_prefix = img_prefix
-        # load annotations (and proposals)
-        self.img_infos = self.load_annotations(ann_file)
-        if proposal_file is not None:
-            self.proposals = self.load_proposals(proposal_file)
-        else:
-            self.proposals = None
-        # filter images with no annotation during training
-        if not test_mode:
-            valid_inds = self._filter_imgs()
-            self.img_infos = [self.img_infos[i] for i in valid_inds]
-            if self.proposals is not None:
-                self.proposals = [self.proposals[i] for i in valid_inds]
+    for l in range(len(annos[index][0])):
+        anno = annos[index][0][l]
+        cityname = anno[0][0][0][0]
+        imgname = anno[0][0][1][0]
+        gts = anno[0][0][2]
+        img_path = os.path.join(all_img_path, mode + '/' + cityname + '/' + imgname)
+        boxes = []
+        ig_boxes = []
+        vis_boxes = []
+        for i in range(len(gts)):
+            label, x1, y1, w, h = gts[i, :5]
+            x1, y1 = max(int(x1), 0), max(int(y1), 0)
+            w, h = min(int(w), cols - x1 - 1), min(int(h), rows - y1 - 1)
+            xv1, yv1, wv, hv = gts[i, 6:]
+            xv1, yv1 = max(int(xv1), 0), max(int(yv1), 0)
+            wv, hv = min(int(wv), cols - xv1 - 1), min(int(hv), rows - yv1 - 1)
 
-        # (long_edge, short_edge) or [(long1, short1), (long2, short2), ...]
-        self.img_scales = img_scale if isinstance(img_scale,
-                                                  list) else [img_scale]
-        assert mmcv.is_list_of(self.img_scales, tuple)
-        # normalization configs
-        self.img_norm_cfg = img_norm_cfg
-
-        # multi-scale mode (only applicable for multi-scale training)
-        self.multiscale_mode = multiscale_mode
-        assert multiscale_mode in ['value', 'range']
-
-        # max proposals per image
-        self.num_max_proposals = num_max_proposals
-        # flip ratio
-        self.flip_ratio = flip_ratio
-        assert flip_ratio >= 0 and flip_ratio <= 1
-        # padding border to ensure the image size can be divided by
-        # size_divisor (used for FPN)
-        self.size_divisor = size_divisor
-
-        # with mask or not (reserved field, takes no effect)
-        self.with_mask = with_mask
-        # some datasets provide bbox annotations as ignore/crowd/difficult,
-        # if `with_crowd` is True, then these info is returned.
-        self.with_crowd = with_crowd
-        # with label is False for RPN
-        self.with_label = with_label
-        # with semantic segmentation (stuff) annotation or not
-        self.with_seg = with_semantic_seg
-        # prefix of semantic segmentation map path
-        self.seg_prefix = seg_prefix
-        # rescale factor for segmentation maps
-        self.seg_scale_factor = seg_scale_factor
-        # in test mode or not
-        self.test_mode = test_mode
-        # remove small size box in gt
-        self.remove_small_box = remove_small_box
-        # the smallest box edge
-        self.small_box_size = small_box_size
-        # strides of FPN style outputs, used for generating groundtruth feature maps
-        self.strides = strides
-        # regress range of FPN style outputs, used for generating groundtruth feature maps
-        self.regress_ranges = regress_ranges
-        # upper factor for Irtiza's model which use three branches to predict upper box, full box, lower box
-        self.upper_factor = upper_factor
-        # split the upper box into more boxes
-        self.upper_more_factor = upper_more_factor
-
-        # set group flag for the sampler
-        if not self.test_mode:
-            self._set_group_flag()
-        # transforms
-        self.img_transform = ImageTransform(
-            size_divisor=self.size_divisor, **self.img_norm_cfg)
-        self.bbox_transform = BboxTransform()
-        self.mask_transform = MaskTransform()
-        self.seg_transform = SegMapTransform(self.size_divisor)
-        self.numpy2tensor = Numpy2Tensor()
-
-        # if use extra augmentation
-        if extra_aug is not None:
-            self.extra_aug = ExtraAugmentation(**extra_aug)
-        else:
-            self.extra_aug = None
-
-        # image rescale if keep ratio
-        self.resize_keep_ratio = resize_keep_ratio
-
-        #predict width
-        self.with_width = with_width
-
-    def load_annotations(self, ann_file):
-        self.coco = COCO(ann_file)
-        self.cat_ids = self.coco.getCatIds()
-        self.cat2label = {
-            cat_id: i + 1
-            for i, cat_id in enumerate(self.cat_ids)
-        }
-        self.img_ids = self.coco.getImgIds()
-        img_infos = []
-        for i in self.img_ids:
-            info = self.coco.loadImgs([i])[0]
-            info['filename'] = info['file_name']
-            img_infos.append(info)
-        return img_infos
-
-    def get_ann_info(self, idx):
-        img_id = self.img_infos[idx]['id']
-        ann_ids = self.coco.getAnnIds(imgIds=[img_id])
-        ann_info = self.coco.loadAnns(ann_ids)
-        return self._parse_ann_info(ann_info, self.with_mask)
-
-    def _filter_imgs(self, min_size=32):
-        """Filter images too small or without ground truths."""
-        valid_inds = []
-        for i, img_info in enumerate(self.img_infos):
-            if min(img_info['width'], img_info['height']) >= min_size:
-                valid_inds.append(i)
-        return valid_inds
-
-    def _parse_ann_info(self, ann_info, with_mask=True):
-        """Parse bbox and mask annotation.
-
-        Args:
-            ann_info (list[dict]): Annotation info of an image.
-            with_mask (bool): Whether to parse mask annotations.
-
-        Returns:
-            dict: A dict containing the following keys: bboxes, bboxes_ignore,
-                labels, masks, mask_polys, poly_lens.
-        """
-        gt_bboxes = []
-        gt_labels = []
-        gt_bboxes_ignore = []
-        # Two formats are provided.
-        # 1. mask: a binary map of the same size of the image.
-        # 2. polys: each mask consists of one or several polys, each poly is a
-        # list of float.
-        if with_mask:
-            gt_masks = []
-            gt_mask_polys = []
-            gt_poly_lens = []
-        for i, ann in enumerate(ann_info):
-            if ann.get('ignore', False):
-                continue
-            x1, y1, w, h = ann['bbox']
-            #if ann['area'] <= 0 or w < 1 or h < 1:
-            #    continue
-            if w < 1 or h < 1:
-                continue
-            bbox = [x1, y1, x1 + w - 1, y1 + h - 1]
-            if ('iscrowd' in ann and ann['iscrowd']) or ('ignore' in ann and ann['ignore'] == 1):
-                gt_bboxes_ignore.append(bbox)
+            if label == 1 and h >= 50:
+                box = np.array([int(x1), int(y1), int(x1) + int(w), int(y1) + int(h)])
+                boxes.append(box)
+                vis_box = np.array([int(xv1), int(yv1), int(xv1) + int(wv), int(yv1) + int(hv)])
+                vis_boxes.append(vis_box)
             else:
-                gt_bboxes.append(bbox)
-                gt_labels.append(self.cat2label[ann['category_id']])
-            if with_mask:
-                #create fake segmentation
-                if "segmentation" not in ann:
-                    bbox = ann['bbox']
-                    ann['segmentation'] = [[bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1],
-                                           bbox[0], bbox[1] + bbox[3], bbox[0] + bbox[2], bbox[1] + bbox[3]]]
-                gt_masks.append(self.coco.annToMask(ann))
-                # cv2.imshow('', gt_masks[-1]*255)
-                # cv2.waitKey(0)
-                # print(gt_masks[-1].shape)
-                mask_polys = [
-                    p for p in ann['segmentation'] if len(p) >= 6
-                ]  # valid polygons have >= 3 points (6 coordinates)
-                poly_lens = [len(p) for p in mask_polys]
-                gt_mask_polys.append(mask_polys)
-                gt_poly_lens.extend(poly_lens)
-        if gt_bboxes:
-            gt_bboxes = np.array(gt_bboxes, dtype=np.float32)
-            gt_labels = np.array(gt_labels, dtype=np.int64)
-        else:
-            gt_bboxes = np.zeros((0, 4), dtype=np.float32)
-            gt_labels = np.array([], dtype=np.int64)
+                ig_box = np.array([int(x1), int(y1), int(x1) + int(w), int(y1) + int(h)])
+                ig_boxes.append(ig_box)
+        boxes = np.array(boxes)
+        vis_boxes = np.array(vis_boxes)
+        ig_boxes = np.array(ig_boxes)
 
-        if gt_bboxes_ignore:
-            gt_bboxes_ignore = np.array(gt_bboxes_ignore, dtype=np.float32)
-        else:
-            gt_bboxes_ignore = np.zeros((0, 4), dtype=np.float32)
+        if len(boxes) > 0:
+            valid_count += 1
+        annotation = {}
+        annotation['filepath'] = img_path
+        box_count += len(boxes)
+        iggt_count += len(ig_boxes)
+        annotation['bboxes'] = boxes
+        annotation['vis_bboxes'] = vis_boxes
+        annotation['ignoreareas'] = ig_boxes
+        image_data.append(annotation)
 
-        ann = dict(
-            bboxes=gt_bboxes, labels=gt_labels, bboxes_ignore=gt_bboxes_ignore)
-
-        if with_mask:
-            ann['masks'] = gt_masks
-            # poly format is not used in the current implementation
-            ann['mask_polys'] = gt_mask_polys
-            ann['poly_lens'] = gt_poly_lens
-        return ann
-
-    def prepare_train_img(self, idx):
-        img_info = self.img_infos[idx]
-        # load image
-        img = mmcv.imread(osp.join(self.img_prefix, img_info['filename']))
-        # load proposals if necessary
-        if self.proposals is not None:
-            proposals = self.proposals[idx][:self.num_max_proposals]
-            # TODO: Handle empty proposals properly. Currently images with
-            # no proposals are just ignored, but they can be used for
-            # training in concept.
-            if len(proposals) == 0:
-                return None
-            if not (proposals.shape[1] == 4 or proposals.shape[1] == 5):
-                raise AssertionError(
-                    'proposals should have shapes (n, 4) or (n, 5), '
-                    'but found {}'.format(proposals.shape))
-            if proposals.shape[1] == 5:
-                scores = proposals[:, 4, None]
-                proposals = proposals[:, :4]
-            else:
-                scores = None
-
-        ann = self.get_ann_info(idx)
-        gt_bboxes = ann['bboxes']
-        gt_labels = ann['labels']
-        if self.with_crowd:
-            gt_bboxes_ignore = ann['bboxes_ignore']
-
-        assert len(self.img_scales[0]) == 2 and isinstance(self.img_scales[0][0], int)
-
-        img, gt_bboxes, gt_labels, gt_bboxes_ignore = augment(img, gt_bboxes, gt_labels, gt_bboxes_ignore, self.img_scales[0], small_box_to_ignore=self.small_box_to_ignore)
-        ori_shape = img.shape[:2]
-        img, img_shape, pad_shape, scale_factor = self.img_transform(
-            img, img.shape[:2], False, keep_ratio=self.resize_keep_ratio)
-        assert (scale_factor == 1)
-        img_meta = dict(
-            ori_shape=ori_shape,
-            img_shape=ori_shape,
-            pad_shape=(0,0),
-            scale_factor=1,
-            flip=False,
-            name=img_info['filename'],
-        )
-
-        pos_maps = []
-        scale_maps = []
-        offset_maps = []
-        if not self.with_crowd:
-            gt_bboxes_ignore = None
-        for i, stride in enumerate(self.strides):
-            pos_map, scale_map, offset_map = self.calc_gt_center(gt_bboxes, gt_bboxes_ignore, \
-                                            stride=stride, regress_range=self.regress_ranges[i], image_shape=ori_shape)
-            pos_maps.append(pos_map)
-            scale_maps.append(scale_map)
-            offset_maps.append(offset_map)
-
-
-        data = dict(
-            img=DC(to_tensor(img), stack=True),
-            img_meta=DC(img_meta, cpu_only=True),
-            gt_bboxes=DC(to_tensor(gt_bboxes)))
-        if self.proposals is not None:
-            data['proposals'] = DC(to_tensor(proposals))
-        if self.with_label:
-            data['gt_labels'] = DC(to_tensor(gt_labels))
-        if self.with_crowd:
-            data['gt_bboxes_ignore'] = DC(to_tensor(gt_bboxes_ignore))
-
-        data['classification_maps'] = DC([to_tensor(pos_map) for pos_map in pos_maps])
-        data['scale_maps'] = DC([to_tensor(scale_map) for scale_map in scale_maps])
-        data['offset_maps'] = DC([to_tensor(offset_map) for offset_map in offset_maps])
-        return data
-
-    def calc_gt_center(self, gts, igs, radius=8, stride=4, regress_range=(-1, INF), image_shape=None):
-
-        def gaussian(kernel):
-            sigma = ((kernel-1) * 0.5 - 1) * 0.3 + 0.8
-            s = 2*(sigma**2)
-            dx = np.exp(-np.square(np.arange(kernel) - int(kernel / 2)) / s)
-            return np.reshape(dx, (-1, 1))
-        radius = int(radius/stride)
-        if not self.with_width:
-            scale_map = np.zeros((2, int(image_shape[0] / stride), int(image_shape[1] / stride)), dtype=np.float32)
-        else:
-            scale_map = np.zeros((3, int(image_shape[0] / stride), int(image_shape[1] / stride)), dtype=np.float32)
-        offset_map = np.zeros((3, int(image_shape[0] / stride), int(image_shape[1] / stride)), dtype=np.float32)
-        pos_map = np.zeros((3, int(image_shape[0] / stride), int(image_shape[1] / stride)), dtype=np.float32)
-        pos_map[1, :, :, ] = 1  # channel 0: loss weights; channel 1: for ignore, ignore area will be set to 0; channel 2: classification
-
-        if not igs is None and len(igs) > 0:
-            igs = igs / stride
-            for ind in range(len(igs)):
-                x1, y1, x2, y2 = int(igs[ind, 0]), int(igs[ind, 1]), int(np.ceil(igs[ind, 2])), int(np.ceil(igs[ind, 3]))
-                pos_map[1, y1:y2, x1:x2] = 0
-        half_height = gts[:, 3] - gts[:, 1]
-        half_height = (half_height >= regress_range[0]) & (half_height <= regress_range[1])
-        inds = half_height.nonzero()
-        gts = gts[inds]
-        if len(gts) > 0:
-            gts = gts / stride
-            for ind in range(len(gts)):
-                x1, y1, x2, y2 = int(np.ceil(gts[ind, 0])), int(np.ceil(gts[ind, 1])), int(gts[ind, 2]), int(gts[ind, 3])
-                c_x, c_y = int((gts[ind, 0] + gts[ind, 2]) / 2), int((gts[ind, 1] + gts[ind, 3]) / 2)
-
-                dx = gaussian(x2-x1)
-                dy = gaussian(y2-y1)
-                gau_map = np.multiply(dy, np.transpose(dx))
-
-                pos_map[0, y1:y2, x1:x2] = np.maximum(pos_map[0, y1:y2, x1:x2], gau_map)  # gauss map
-                pos_map[1, y1:y2, x1:x2] = 1  # 1-mask map
-                pos_map[2, c_y, c_x] = 1  # center map
-
-                if not self.with_width:
-                    scale_map[0, c_y-radius:c_y+radius+1, c_x-radius:c_x+radius+1] = np.log(gts[ind, 3] - gts[ind, 1]) # value of height
-                    scale_map[1, c_y-radius:c_y+radius+1, c_x-radius:c_x+radius+1] = 1  # 1-mask
-                else:
-                    scale_map[0, c_y-radius:c_y+radius+1, c_x-radius:c_x+radius+1] = np.log(gts[ind, 3] - gts[ind, 1]) # value of height
-                    scale_map[1, c_y-radius:c_y+radius+1, c_x-radius:c_x+radius+1] = np.log(gts[ind, 2] - gts[ind, 0]) # value of height
-                    scale_map[2, c_y-radius:c_y+radius+1, c_x-radius:c_x+radius+1] = 1  # 1-mask
-
-
-                offset_map[0, c_y, c_x] = (gts[ind, 1] + gts[ind, 3]) / 2 - c_y - 0.5  # height-Y offset
-                offset_map[1, c_y, c_x] = (gts[ind, 0] + gts[ind, 2]) / 2 - c_x - 0.5  # width-X offset
-                offset_map[2, c_y, c_x] = 1  # 1-mask
-
-        return pos_map[None], scale_map[None], offset_map[None]
+    return image_data
 
 
 def _brightness(image, min=0.5, max=2.0):
@@ -989,7 +109,7 @@ def resize_image(image, gts, igs, scale=(0.4, 1.5)):
     return image, gts, igs
 
 
-def random_crop(image, gts, gt_labels, igs, crop_size, limit=8, small_box_to_ignore=False):
+def random_crop(image, gts, igs, crop_size, limit=8):
     img_height, img_width = image.shape[0:2]
     crop_h, crop_w = crop_size
 
@@ -1009,8 +129,14 @@ def random_crop(image, gts, gt_labels, igs, crop_size, limit=8, small_box_to_ign
     crop_y1 -= diff_y
     cropped_image = np.copy(image[crop_y1:crop_y1 + crop_h, crop_x1:crop_x1 + crop_w])
     # crop detections
-
-    add_ign = None
+    if len(igs) > 0:
+        igs[:, 0:4:2] -= crop_x1
+        igs[:, 1:4:2] -= crop_y1
+        igs[:, 0:4:2] = np.clip(igs[:, 0:4:2], 0, crop_w)
+        igs[:, 1:4:2] = np.clip(igs[:, 1:4:2], 0, crop_h)
+        keep_inds = ((igs[:, 2] - igs[:, 0]) >= 8) & \
+                    ((igs[:, 3] - igs[:, 1]) >= 8)
+        igs = igs[keep_inds]
     if len(gts) > 0:
         ori_gts = np.copy(gts)
         gts[:, 0:4:2] -= crop_x1
@@ -1023,26 +149,12 @@ def random_crop(image, gts, gt_labels, igs, crop_size, limit=8, small_box_to_ign
 
         keep_inds = ((gts[:, 2] - gts[:, 0]) >= limit) & \
                     (after_area >= 0.5 * before_area)
-        ign_inds = np.logical_not(keep_inds)
-        add_ign = gts[ign_inds]
         gts = gts[keep_inds]
-        gt_labels = gt_labels[keep_inds]
 
-    if len(igs) > 0:
-        igs[:, 0:4:2] -= crop_x1
-        igs[:, 1:4:2] -= crop_y1
-        igs[:, 0:4:2] = np.clip(igs[:, 0:4:2], 0, crop_w)
-        igs[:, 1:4:2] = np.clip(igs[:, 1:4:2], 0, crop_h)
-        if add_ign is not None and small_box_to_ignore:
-            igs = np.concatenate((add_ign, igs), axis=0)
-        keep_inds = ((igs[:, 2] - igs[:, 0]) >= 8) & \
-                    ((igs[:, 3] - igs[:, 1]) >= 8)
-        igs = igs[keep_inds]
-
-    return cropped_image, gts, gt_labels, igs
+    return cropped_image, gts, igs
 
 
-def random_pave(image, gts, gt_labels, igs, pave_size, limit=8, small_box_to_ignore=False):
+def random_pave(image, gts, igs, pave_size, limit=8):
     img_height, img_width = image.shape[0:2]
     pave_h, pave_w = pave_size
     # paved_image = np.zeros((pave_h, pave_w, 3), dtype=image.dtype)
@@ -1051,79 +163,311 @@ def random_pave(image, gts, gt_labels, igs, pave_size, limit=8, small_box_to_ign
     pave_y = int(np.random.randint(0, pave_h - img_height + 1))
     paved_image[pave_y:pave_y + img_height, pave_x:pave_x + img_width] = image
     # pave detections
-    add_ign = None
+    if len(igs) > 0:
+        igs[:, 0:4:2] += pave_x
+        igs[:, 1:4:2] += pave_y
+        keep_inds = ((igs[:, 2] - igs[:, 0]) >= 8) & \
+                    ((igs[:, 3] - igs[:, 1]) >= 8)
+        igs = igs[keep_inds]
 
     if len(gts) > 0:
         gts[:, 0:4:2] += pave_x
         gts[:, 1:4:2] += pave_y
         keep_inds = ((gts[:, 2] - gts[:, 0]) >= limit)
-        ign_inds = np.logical_not(keep_inds)
-        add_ign = gts[ign_inds]
         gts = gts[keep_inds]
-        gt_labels = gt_labels[keep_inds]
 
-    if len(igs) > 0:
-        igs[:, 0:4:2] += pave_x
-        igs[:, 1:4:2] += pave_y
-        if add_ign is not None and small_box_to_ignore:
-            igs = np.concatenate((add_ign, igs), axis=0)
-        keep_inds = ((igs[:, 2] - igs[:, 0]) >= 8) & \
-                    ((igs[:, 3] - igs[:, 1]) >= 8)
-        igs = igs[keep_inds]
-
-    return paved_image, gts, gt_labels, igs
+    return paved_image, gts, igs
 
 
-def augment(img, gt_bboxes, gt_labels, gt_bboxes_ignore, size_train, small_box_to_ignore=False):
-    size_train = (size_train[1], size_train[0])
+def augment(img_data, c, img):
+    assert 'filepath' in img_data
+    assert 'bboxes' in img_data
+    img_data_aug = copy.deepcopy(img_data)
+    if img is None:
+        img = cv2.imread(img_data_aug['filepath'])
     img_height, img_width = img.shape[:2]
-    gt_bboxes[:, [0, 2]] = np.clip(gt_bboxes[:, [0, 2]], 0, img_width-1)
-    gt_bboxes[:, [1, 3]] = np.clip(gt_bboxes[:, [1, 3]], 0, img_height-1)
-    gt_bboxes_ignore[:, [0, 2]] = np.clip(gt_bboxes_ignore[:, [0, 2]], 0, img_width-1)
-    gt_bboxes_ignore[:, [1, 3]] = np.clip(gt_bboxes_ignore[:, [1, 3]], 0, img_height-1)
 
     # random brightness
-    if np.random.randint(0, 2) == 0:
-        img = _brightness(img, min=0.5, max=2)
+    if c.brightness and np.random.randint(0, 2) == 0:
+        img = _brightness(img, min=c.brightness[0], max=c.brightness[1])
     # random horizontal flip
-    if  np.random.randint(0, 2) == 0:
+    if c.use_horizontal_flips and np.random.randint(0, 2) == 0:
         img = cv2.flip(img, 1)
-        if len(gt_bboxes) > 0:
-            gt_bboxes[:, [0, 2]] = img_width - gt_bboxes[:, [2, 0]]
-        if len(gt_bboxes_ignore) > 0:
-            gt_bboxes_ignore[:, [0, 2]] = img_width - gt_bboxes_ignore[:, [2, 0]]
+        if len(img_data_aug['bboxes']) > 0:
+            img_data_aug['bboxes'][:, [0, 2]] = img_width - img_data_aug['bboxes'][:, [2, 0]]
+        if len(img_data_aug['ignoreareas']) > 0:
+            img_data_aug['ignoreareas'][:, [0, 2]] = img_width - img_data_aug['ignoreareas'][:, [2, 0]]
 
-    img, gt_bboxes, gt_bboxes_ignore = resize_image(img, gt_bboxes, gt_bboxes_ignore, scale=(0.4, 1.5))
+    gts = np.copy(img_data_aug['bboxes'])
+    igs = np.copy(img_data_aug['ignoreareas'])
 
-    if img.shape[0] >= size_train[0]:
-        img, gt_bboxes, gt_labels, gt_bboxes_ignore = random_crop(img, gt_bboxes, gt_labels, gt_bboxes_ignore, size_train, limit=16, small_box_to_ignore=small_box_to_ignore)
+    img, gts, igs = resize_image(img, gts, igs, scale=(0.4, 1.5))
+    if img.shape[0] >= c.size_train[0]:
+        img, gts, igs = random_crop(img, gts, igs, c.size_train, limit=16)
     else:
-        img, gt_bboxes, gt_labels, gt_bboxes_ignore = random_pave(img, gt_bboxes, gt_labels, gt_bboxes_ignore, size_train, limit=16, small_box_to_ignore=small_box_to_ignore)
+        img, gts, igs = random_pave(img, gts, igs, c.size_train, limit=16)
 
-    img_height, img_width = img.shape[:2]
-    gt_bboxes[:, [0, 2]] = np.clip(gt_bboxes[:, [0, 2]], 0, img_width - 1)
-    gt_bboxes[:, [1, 3]] = np.clip(gt_bboxes[:, [1, 3]], 0, img_height - 1)
-    gt_bboxes_ignore[:, [0, 2]] = np.clip(gt_bboxes_ignore[:, [0, 2]], 0, img_width - 1)
-    gt_bboxes_ignore[:, [1, 3]] = np.clip(gt_bboxes_ignore[:, [1, 3]], 0, img_height - 1)
+    img_data_aug['bboxes'] = gts
+    img_data_aug['ignoreareas'] = igs
 
-    return img, gt_bboxes, gt_labels, gt_bboxes_ignore
+    img_data_aug['width'] = c.size_train[1]
+    img_data_aug['height'] = c.size_train[0]
 
-img_norm_cfg = dict(
-    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
-dataset = CocoCSPORIDataset(ann_file='datasets/train.json', img_prefix='datasets/CityPersons/', img_scale=(2048, 1024),
-        img_norm_cfg=img_norm_cfg,
-        small_box_to_ignore=False,
-        size_divisor=32,
-        flip_ratio=0.5,
-        with_mask=False,
-        with_crowd=True,
-        with_label=True,
-        remove_small_box=True,
-        small_box_size=8,
-        strides=[4],
-        regress_ranges=((-1, INF),))
+    return img_data_aug, img
 
-from torch.utils.data import DataLoader
-dataloader = DataLoader(dataset)
-for batch in dataloader:
-    print(1)
+
+class CityPersons(Dataset):
+    def __init__(self, path, mode, config, transform=None):
+        if transform is None:
+            transform = transforms.Compose(
+                [transforms.ColorJitter(brightness=0.5), transforms.ToTensor(),
+                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        self.dataset = get_citypersons(root_dir=path, mode=mode)
+        self.dataset_len = len(self.dataset)
+        self.mode = mode
+
+        if self.mode == 'train' and config.train_random:
+            random.shuffle(self.dataset)
+        self.config = config
+        self.transform = transform
+
+        if self.mode == 'train':
+            self.preprocess = RandomResizeFix(size=config.size_train, scale=(0.4, 1.5))
+        else:
+            self.preprocess = None
+
+    def __getitem__(self, item):
+
+        # input is RGB order, and normalized
+        img_data = self.dataset[item]
+        img = Image.open(img_data['filepath'])
+
+        if self.mode == 'train':
+            gts = img_data['bboxes'].copy()
+            igs = img_data['ignoreareas'].copy()
+
+            x_img, gts, igs = self.preprocess(img, gts, igs)
+
+            y_center, y_height, y_offset = self.calc_gt_center(gts, igs, radius=2, stride=self.config.down)
+
+            if self.transform is not None:
+                x_img = self.transform(x_img)
+
+            return x_img, [y_center, y_height, y_offset]
+
+        else:
+            if self.transform is not None:
+                x_img = self.transform(img)
+            else:
+                x_img = img
+
+            return x_img
+
+    def __len__(self):
+        return self.dataset_len
+
+    def calc_gt_center(self, gts, igs, radius=2, stride=4):
+
+        def gaussian(kernel):
+            sigma = ((kernel - 1) * 0.5 - 1) * 0.3 + 0.8
+            s = 2 * (sigma ** 2)
+            dx = np.exp(-np.square(np.arange(kernel) - int(kernel / 2)) / s)
+            return np.reshape(dx, (-1, 1))
+
+        scale_map = np.zeros((2, int(self.config.size_train[0] / stride), int(self.config.size_train[1] / stride)))
+        offset_map = np.zeros((3, int(self.config.size_train[0] / stride), int(self.config.size_train[1] / stride)))
+        pos_map = np.zeros((3, int(self.config.size_train[0] / stride), int(self.config.size_train[1] / stride)))
+        pos_map[1, :, :, ] = 1  # channel 1: 1-value mask, ignore area will be set to 0
+
+        if len(igs) > 0:
+            igs = igs / stride
+            for ind in range(len(igs)):
+                x1, y1, x2, y2 = int(igs[ind, 0]), int(igs[ind, 1]), int(np.ceil(igs[ind, 2])), int(
+                    np.ceil(igs[ind, 3]))
+                pos_map[1, y1:y2, x1:x2] = 0
+
+        if len(gts) > 0:
+            gts = gts / stride
+            for ind in range(len(gts)):
+                x1, y1, x2, y2 = int(np.ceil(gts[ind, 0])), int(np.ceil(gts[ind, 1])), int(gts[ind, 2]), int(
+                    gts[ind, 3])
+                c_x, c_y = int((gts[ind, 0] + gts[ind, 2]) / 2), int((gts[ind, 1] + gts[ind, 3]) / 2)
+
+                dx = gaussian(x2 - x1)
+                dy = gaussian(y2 - y1)
+                gau_map = np.multiply(dy, np.transpose(dx))
+
+                pos_map[0, y1:y2, x1:x2] = np.maximum(pos_map[0, y1:y2, x1:x2], gau_map)  # gauss map
+                pos_map[1, y1:y2, x1:x2] = 1  # 1-mask map
+                pos_map[2, c_y, c_x] = 1  # center map
+
+                scale_map[0, c_y - radius:c_y + radius + 1, c_x - radius:c_x + radius + 1] = np.log(
+                    gts[ind, 3] - gts[ind, 1])  # log value of height
+                scale_map[1, c_y - radius:c_y + radius + 1, c_x - radius:c_x + radius + 1] = 1  # 1-mask
+
+                offset_map[0, c_y, c_x] = (gts[ind, 1] + gts[ind, 3]) / 2 - c_y - 0.5  # height-Y offset
+                offset_map[1, c_y, c_x] = (gts[ind, 0] + gts[ind, 2]) / 2 - c_x - 0.5  # width-X offset
+                offset_map[2, c_y, c_x] = 1  # 1-mask
+
+        return pos_map, scale_map, offset_map
+
+
+class RandomResizeFix(object):
+    """
+    Args:
+        size: expected output size of each edge
+        scale: scale factor
+        interpolation: Default: PIL.Image.BILINEAR
+    """
+
+    def __init__(self, size, scale=(0.4, 1.5), interpolation=Resampling.BILINEAR):
+        self.size = size
+        self.interpolation = interpolation
+        self.scale = scale
+
+    def __call__(self, img, gts, igs):
+        # resize image
+        w, h = img.size
+        ratio = np.random.uniform(self.scale[0], self.scale[1])
+        n_w, n_h = int(ratio * w), int(ratio * h)
+        img = img.resize((n_w, n_h), self.interpolation)
+        gts = gts.copy()
+        igs = igs.copy()
+
+        # resize label
+        if len(gts) > 0:
+            gts = np.asarray(gts, dtype=float)
+            gts *= ratio
+
+        if len(igs) > 0:
+            igs = np.asarray(igs, dtype=float)
+            igs *= ratio
+
+        # random flip
+        w, h = img.size
+        if np.random.randint(0, 2) == 0:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            if len(gts) > 0:
+                gts[:, [0, 2]] = w - gts[:, [2, 0]]
+            if len(igs) > 0:
+                igs[:, [0, 2]] = w - igs[:, [2, 0]]
+
+        if h >= self.size[0]:
+            # random crop
+            img, gts, igs = self.random_crop(img, gts, igs, self.size, limit=16)
+        else:
+            # random pad
+            img, gts, igs = self.random_pave(img, gts, igs, self.size, limit=16)
+
+        return img, gts, igs
+
+    @staticmethod
+    def random_crop(img, gts, igs, size, limit=8):
+        w, h = img.size
+        crop_h, crop_w = size
+
+        if len(gts) > 0:
+            sel_id = np.random.randint(0, len(gts))
+            sel_center_x = int((gts[sel_id, 0] + gts[sel_id, 2]) / 2.0)
+            sel_center_y = int((gts[sel_id, 1] + gts[sel_id, 3]) / 2.0)
+        else:
+            sel_center_x = int(np.random.randint(0, w - crop_w + 1) + crop_w * 0.5)
+            sel_center_y = int(np.random.randint(0, h - crop_h + 1) + crop_h * 0.5)
+
+        crop_x1 = max(sel_center_x - int(crop_w * 0.5), int(0))
+        crop_y1 = max(sel_center_y - int(crop_h * 0.5), int(0))
+        diff_x = max(crop_x1 + crop_w - w, int(0))
+        crop_x1 -= diff_x
+        diff_y = max(crop_y1 + crop_h - h, int(0))
+        crop_y1 -= diff_y
+        cropped_img = img.crop((crop_x1, crop_y1, crop_x1 + crop_w, crop_y1 + crop_h))
+
+        # crop detections
+        if len(igs) > 0:
+            igs[:, 0:4:2] -= crop_x1
+            igs[:, 1:4:2] -= crop_y1
+            igs[:, 0:4:2] = np.clip(igs[:, 0:4:2], 0, crop_w)
+            igs[:, 1:4:2] = np.clip(igs[:, 1:4:2], 0, crop_h)
+            keep_inds = ((igs[:, 2] - igs[:, 0]) >= 8) & ((igs[:, 3] - igs[:, 1]) >= 8)
+            igs = igs[keep_inds]
+
+        if len(gts) > 0:
+            before_area = (gts[:, 2] - gts[:, 0]) * (gts[:, 3] - gts[:, 1])
+            gts[:, 0:4:2] -= crop_x1
+            gts[:, 1:4:2] -= crop_y1
+            gts[:, 0:4:2] = np.clip(gts[:, 0:4:2], 0, crop_w)
+            gts[:, 1:4:2] = np.clip(gts[:, 1:4:2], 0, crop_h)
+
+            after_area = (gts[:, 2] - gts[:, 0]) * (gts[:, 3] - gts[:, 1])
+
+            keep_inds = ((gts[:, 2] - gts[:, 0]) >= limit) & (after_area >= 0.5 * before_area)
+            gts = gts[keep_inds]
+
+        return cropped_img, gts, igs
+
+    @staticmethod
+    def random_pave(img, gts, igs, size, limit=8):
+        img = np.asarray(img)
+        h, w = img.shape[0:2]
+        pave_h, pave_w = size
+        # paved_image = np.zeros((pave_h, pave_w, 3), dtype=image.dtype)
+        paved_image = np.ones((pave_h, pave_w, 3), dtype=img.dtype) * np.mean(img, dtype=int)
+        pave_x = int(np.random.randint(0, pave_w - w + 1))
+        pave_y = int(np.random.randint(0, pave_h - h + 1))
+        paved_image[pave_y:pave_y + h, pave_x:pave_x + w] = img
+        # pave detections
+        if len(igs) > 0:
+            igs[:, 0:4:2] += pave_x
+            igs[:, 1:4:2] += pave_y
+            keep_inds = ((igs[:, 2] - igs[:, 0]) >= 8) & ((igs[:, 3] - igs[:, 1]) >= 8)
+            igs = igs[keep_inds]
+
+        if len(gts) > 0:
+            gts[:, 0:4:2] += pave_x
+            gts[:, 1:4:2] += pave_y
+            keep_inds = ((gts[:, 2] - gts[:, 0]) >= limit)
+            gts = gts[keep_inds]
+
+        return Image.fromarray(paved_image), gts, igs
+
+
+class Config(object):
+    def __init__(self):
+        self.gpu_ids = [0, 1]
+        self.onegpu = 4
+        self.num_epochs = 150
+        self.add_epoch = 0
+        self.iter_per_epoch = 2000
+        self.init_lr = 2e-4
+        self.alpha = 0.999
+
+        # dataset
+        self.train_path = './data/citypersons'
+        self.train_random = True
+
+        # setting for network architechture
+        self.network = 'resnet50'  # or 'mobilenet'
+        self.point = 'center'  # or 'top', 'bottom
+        self.scale = 'h'  # or 'w', 'hw'
+        self.num_scale = 1  # 1 for height (or width) prediction, 2 for height+width prediction
+        self.offset = True  # append offset prediction or not
+        self.down = 4  # downsampling rate of the feature map for detection
+        self.radius = 2  # surrounding areas of positives for the scale map
+
+        # setting for data augmentation
+        self.use_horizontal_flips = True
+        self.brightness = (0.5, 2, 0.5)
+        self.size_train = (640, 1280)
+        self.size_test = (1024, 2048)
+
+        # image channel-wise mean to subtract, the order is BGR
+        self.img_channel_mean = [103.939, 116.779, 123.68]
+
+        # use teacher
+        self.teacher = True
+
+        self.test_path = './data/citypersons'
+
+        # whether or not to do validation during training
+        self.val = True
+        self.val_frequency = 1
