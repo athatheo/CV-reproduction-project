@@ -16,6 +16,7 @@ model.cuda()
 model.train()
 print(len(loader))
 
+
 for batch in loader:
     inputs, labels = batch
     inputs = inputs.to(device=device)
