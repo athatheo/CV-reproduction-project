@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/CV-reproduction-project.iml" filepath="$PROJECT_DIR$/.idea/CV-reproduction-project.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/HRNet.iml" filepath="$PROJECT_DIR$/.idea/HRNet.iml" />
     </modules>
   </component>
 </project>
