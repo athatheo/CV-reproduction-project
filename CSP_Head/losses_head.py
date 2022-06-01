@@ -14,10 +14,13 @@ def loss_center(pred, labels):
     pred : center map output of the detection head
     """
     classification_loss = nn.functional.binary_cross_entropy(
-        pred.float(), labels[2][:, 2, :, :].float(), reduction="none")
+        pred.float().squeeze(dim = 1), labels[2][:, 2, :, :].float(), reduction="none")
 
-    positives = labels[2][:, 2, :, :] == 1  # positives(i,j) == 1 if yij = 1
-    negatives = labels[2][:, 2, :, :] < 1  # negatives(i,j) == 1 if yij = 0
+    #positives = labels[2][:, 2, :, :] == 1  # positives(i,j) == 1 if yij = 1
+    #negatives = labels[2][:, 2, :, :] < 1  # negatives(i,j) == 1 if yij = 0
+
+    positives = labels[2][:,2,:,:]
+    negatives = labels[2][:,1,:,:] - labels[2][:,2,:,:]
 
     foreground_weight = positives * (1.0 - pred) ** 2.0
 
@@ -30,11 +33,10 @@ def loss_center(pred, labels):
         labels[2][:, 2, :, :], dim=(1, 2))   # = nb of objects
     K = th.max(th.stack((assigned_boxes, th.ones(assigned_boxes.shape)), dim=0), dim=0)[
         0]  # nb of people
+ 
+    class_loss = th.sum(th.sum(focal_weight*classification_loss, dim=(1,2,3)) / K).unsqueeze(dim = 0)
 
-    class_loss = 0.01 * \
-        th.sum(th.sum(focal_weight*classification_loss, dim=(1, 2)) / K)
-
-    return class_loss
+    return class_loss #class_loss
 
 
 def loss_scale(h_pred, labels):
@@ -42,13 +44,17 @@ def loss_scale(h_pred, labels):
     h_pred : height prediction
     """
 
-    mask_object = labels[1][:,1,:,:]>0
-    assigned_boxes = th.sum(labels[2][:, 2, :, :], dim=(1, 2))
+    mask_object = labels[1][:,1,:,:]
+    assigned_boxes = th.sum(labels[1][:, 1, :, :], dim=(1, 2))
     K = th.max(th.stack((assigned_boxes, th.ones(
         assigned_boxes.shape)), dim=0), dim=0)[0]
     l1 = nn.L1Loss(reduction='none')
-    loss = mask_object*l1( labels[1][:,0,:,:], h_pred )
-    return 0.05*th.sum(th.sum(loss, dim = (1,2))/K)
+    
+    loss = mask_object*l1( labels[1][:,0,:,:]/ (labels[1][:,0,:,:]+1e-10), h_pred.squeeze(dim = 1)/(labels[1][:,0,:,:] + 1e-10) )
+
+    loss = th.sum(th.sum(loss, dim = (1,2))/K)
+    print(K)
+    return loss
 
 
 def loss_scale_l1(h_pred, labels):
@@ -62,6 +68,12 @@ def loss_scale_l1(h_pred, labels):
 
     # return nn.mean(nn.abs(labels[1][:,0,:,:] - th.log(h_pred[:,:,:,1]), dim = (1,2))/K)
     # index of y_tru and y_pred not correct, must be the height.
+
+def loss(prediction, labels):
+    pred_center, pred_h = prediction
+    loss = 0.05*loss_scale(pred_h, labels) + 0.01 * loss_center(pred_center, labels)
+    print(loss)
+    return loss
 
 
 def gaussian_base(label):

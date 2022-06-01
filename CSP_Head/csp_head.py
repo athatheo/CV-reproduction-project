@@ -20,5 +20,5 @@ class Detection(nn.Module):
         #scale = th.nn.functional.interpolate(scale, size=(1024,2048))
         pred_center = th.sigmoid(center) #prediction heatmap
         pred_scale = nn.functional.relu(scale)
-        pred_scale = th.log(pred_scale)
+        pred_scale = th.log(pred_scale + 1e-10)
         return [pred_center, pred_scale]
