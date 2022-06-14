@@ -1,6 +1,6 @@
 import logging
 from torch import nn
-from checkpoint import load_checkpoint
+
 
 # BatchNorm momentum
 BN_MOMENTUM = 0.2
